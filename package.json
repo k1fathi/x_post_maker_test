@@ -11,6 +11,7 @@
     "dotenv": "^16.4.0",
     "express": "^4.19.0",
     "express-session": "^1.18.0",
+    "oauth-1.0a": "^2.2.6",
     "open": "^10.1.0"
   }
 }

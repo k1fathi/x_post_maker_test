@@ -3,8 +3,11 @@ const express = require("express");
 const session = require("express-session");
 const axios = require("axios");
 const crypto = require("crypto");
+const OAuth = require("oauth-1.0a");
 
 const app = express();
+// behind nginx / Docker, trust proxy so redirects & protocol are correct
+app.set("trust proxy", 1);
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(
@@ -15,48 +18,29 @@ app.use(
   })
 );
 
-const CLIENT_ID = process.env.CLIENT_ID;
-const CLIENT_SECRET = process.env.CLIENT_SECRET;
+const CONSUMER_KEY = process.env.CONSUMER_KEY;
+const CONSUMER_SECRET = process.env.CONSUMER_SECRET;
 const PORT = process.env.PORT || 3000;
-const REDIRECT_URI = process.env.REDIRECT_URI || `http://localhost:${PORT}/callback`;
-const SCOPES = ["tweet.write", "tweet.read", "users.read", "offline.access"].join(" ");
+// For production the callback is https://vibte.co/callback. You can override with REDIRECT_URI if needed.
+const REDIRECT_URI = process.env.REDIRECT_URI || "https://vibte.co/callback";
 
-// ─── OAuth2 helpers ───────────────────────────────────────────────────────────
+// ─── OAuth 1.0a helper ────────────────────────────────────────────────────────
 
-function generatePKCE() {
-  const verifier = crypto.randomBytes(32).toString("base64url");
-  const challenge = crypto.createHash("sha256").update(verifier).digest("base64url");
-  return { verifier, challenge };
-}
-
-async function refreshAccessToken(refreshToken) {
-  console.log("Attempting to refresh access token...");
-  const params = new URLSearchParams({
-    grant_type: "refresh_token",
-    refresh_token: refreshToken,
-    client_id: CLIENT_ID,
-  });
-  const creds = Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString("base64");
-  try {
-    const { data } = await axios.post("https://api.twitter.com/2/oauth2/token", params, {
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-        Authorization: `Basic ${creds}`,
-      },
-    });
-    console.log("Token refresh successful");
-    return data;
-  } catch (err) {
-    console.error("Token refresh failed:", err.response?.data || err.message);
-    throw err;
-  }
-}
+const oauth = OAuth({
+  consumer: { key: CONSUMER_KEY, secret: CONSUMER_SECRET },
+  signature_method: "HMAC-SHA1",
+  hash_function(baseString, key) {
+    return crypto.createHmac("sha1", key).update(baseString).digest("base64");
+  },
+});
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
 
 // 1. Home — show login or post form
 app.get("/", (req, res) => {
-  if (!req.session.accessToken) return res.redirect("/login");
+  if (!req.session.oauthAccessToken || !req.session.oauthAccessTokenSecret) {
+    return res.redirect("/login");
+  }
 
   res.send(`<!DOCTYPE html>
 <html lang="en">
@@ -167,68 +151,102 @@ app.get("/", (req, res) => {
 </html>`);
 });
 
-// 2. Start OAuth2 flow
-app.get("/login", (req, res) => {
-  const { verifier, challenge } = generatePKCE();
-  const state = crypto.randomBytes(16).toString("hex");
-
-  req.session.pkceVerifier = verifier;
-  req.session.oauthState = state;
-
-  const params = new URLSearchParams({
-    response_type: "code",
-    client_id: CLIENT_ID,
-    redirect_uri: REDIRECT_URI,
-    scope: SCOPES,
-    state,
-    code_challenge: challenge,
-    code_challenge_method: "S256",
-  });
-
-  res.redirect(`https://twitter.com/i/oauth2/authorize?${params}`);
-});
-
-// 3. OAuth2 callback
-app.get("/callback", async (req, res) => {
-  const { code, state, error } = req.query;
-  if (error) return res.send(`Auth error: ${error}`);
-  if (state !== req.session.oauthState) return res.send("State mismatch — possible CSRF.");
-
+// 2. Start OAuth 1.0a flow (request token → redirect to X)
+app.get("/login", async (req, res) => {
   try {
-    const params = new URLSearchParams({
-      grant_type: "authorization_code",
-      code,
-      redirect_uri: REDIRECT_URI,
-      code_verifier: req.session.pkceVerifier,
-      client_id: CLIENT_ID,
-    });
+    const requestData = {
+      url: "https://api.twitter.com/oauth/request_token",
+      method: "POST",
+      data: { oauth_callback: REDIRECT_URI },
+    };
 
-    const creds = Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString("base64");
-    console.log("Exchanging code for tokens with redirect_uri:", REDIRECT_URI);
-    const { data } = await axios.post("https://api.twitter.com/2/oauth2/token", params, {
+    const authHeader = oauth.toHeader(oauth.authorize(requestData));
+
+    const { data } = await axios.post(requestData.url, null, {
       headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-        Authorization: `Basic ${creds}`,
+        Authorization: authHeader.Authorization,
       },
     });
 
-    console.log("OAuth token exchange successful");
-    req.session.accessToken = data.access_token;
-    req.session.refreshToken = data.refresh_token;
-    console.log("OAuth tokens received - access_token present:", !!data.access_token, "refresh_token present:", !!data.refresh_token);
-    delete req.session.pkceVerifier;
-    delete req.session.oauthState;
+    const params = new URLSearchParams(data);
+    const oauthToken = params.get("oauth_token");
+    const oauthTokenSecret = params.get("oauth_token_secret");
 
-    res.redirect("/");
+    if (!oauthToken || !oauthTokenSecret) {
+      console.error("Failed to obtain request token:", data);
+      return res.send("Failed to obtain request token. Check your consumer key/secret and app settings.");
+    }
+
+    req.session.oauthRequestToken = oauthToken;
+    req.session.oauthRequestTokenSecret = oauthTokenSecret;
+
+    res.redirect(`https://api.twitter.com/oauth/authenticate?oauth_token=${oauthToken}`);
   } catch (err) {
-    console.error("Token exchange error:", err.response?.data || err.message);
-    res.send("Failed to exchange token. Check your Client ID/Secret.");
+    console.error("Request token error:", err.response?.data || err.message);
+    res.send("Failed to start OAuth 1.0a flow. Check your credentials.");
   }
 });
 
-// 4. Post a tweet (with optional media)
+// 3. OAuth 1.0a callback (exchange request token + verifier for access token)
+app.get("/callback", async (req, res) => {
+  const { oauth_token, oauth_verifier, denied } = req.query;
+
+  if (denied) return res.send("You denied the app.");
+  if (!oauth_token || !oauth_verifier) return res.send("Missing OAuth callback parameters.");
+  if (oauth_token !== req.session.oauthRequestToken) return res.send("Token mismatch — possible CSRF.");
+
+  try {
+    const requestData = {
+      url: "https://api.twitter.com/oauth/access_token",
+      method: "POST",
+      data: { oauth_verifier },
+    };
+
+    const token = {
+      key: req.session.oauthRequestToken,
+      secret: req.session.oauthRequestTokenSecret,
+    };
+
+    const authHeader = oauth.toHeader(oauth.authorize(requestData, token));
+
+    const { data } = await axios.post(requestData.url, null, {
+      headers: {
+        Authorization: authHeader.Authorization,
+      },
+      params: { oauth_verifier },
+    });
+
+    const params = new URLSearchParams(data);
+    const accessToken = params.get("oauth_token");
+    const accessTokenSecret = params.get("oauth_token_secret");
+
+    if (!accessToken || !accessTokenSecret) {
+      console.error("Failed to obtain access token:", data);
+      return res.send("Failed to obtain access token.");
+    }
+
+    req.session.oauthAccessToken = accessToken;
+    req.session.oauthAccessTokenSecret = accessTokenSecret;
+    delete req.session.oauthRequestToken;
+    delete req.session.oauthRequestTokenSecret;
+
+    res.redirect("/");
+  } catch (err) {
+    console.error("Access token error:", err.response?.data || err.message);
+    res.send("Failed to complete OAuth 1.0a callback. Check your app configuration.");
+  }
+});
+
+// 4. Post a tweet (with optional media) using OAuth 1.0a
 app.post("/post", async (req, res) => {
-  if (!req.session.accessToken) return res.status(401).json({ error: "Not authenticated" });
+  if (!req.session.oauthAccessToken || !req.session.oauthAccessTokenSecret) {
+    return res.status(401).json({ error: "Not authenticated" });
+  }
+
+  const userToken = {
+    key: req.session.oauthAccessToken,
+    secret: req.session.oauthAccessTokenSecret,
+  };
 
   const { text, mediaUrl } = req.body;
   if (!text?.trim()) return res.status(400).json({ error: "Tweet text is required" });
@@ -245,15 +263,26 @@ app.post("/post", async (req, res) => {
       const totalBytes = mediaBuffer.length;
 
       // INIT
-      const initParams = new URLSearchParams({
+      const initParams = {
         command: "INIT",
         total_bytes: totalBytes,
         media_type: contentType,
-      });
+      };
+      const initRequestData = {
+        url: "https://upload.twitter.com/1.1/media/upload.json",
+        method: "POST",
+        data: initParams,
+      };
+      const initAuthHeader = oauth.toHeader(oauth.authorize(initRequestData, userToken));
       const initResp = await axios.post(
-        "https://upload.twitter.com/1.1/media/upload.json",
-        initParams,
-        { headers: { Authorization: `Bearer ${req.session.accessToken}` } }
+        initRequestData.url,
+        new URLSearchParams(initParams),
+        {
+          headers: {
+            ...initAuthHeader,
+            "Content-Type": "application/x-www-form-urlencoded",
+          },
+        }
       );
       mediaId = initResp.data.media_id_string;
 
@@ -262,63 +291,86 @@ app.post("/post", async (req, res) => {
       let segmentIndex = 0;
       for (let offset = 0; offset < totalBytes; offset += chunkSize) {
         const chunk = mediaBuffer.slice(offset, offset + chunkSize);
-        const formData = new URLSearchParams({
+        const appendParams = {
           command: "APPEND",
           media_id: mediaId,
           media_data: chunk.toString("base64"),
           segment_index: segmentIndex++,
-        });
-        await axios.post("https://upload.twitter.com/1.1/media/upload.json", formData, {
-          headers: { Authorization: `Bearer ${req.session.accessToken}` },
-        });
+        };
+        const appendRequestData = {
+          url: "https://upload.twitter.com/1.1/media/upload.json",
+          method: "POST",
+          data: appendParams,
+        };
+        const appendAuthHeader = oauth.toHeader(oauth.authorize(appendRequestData, userToken));
+        await axios.post(
+          appendRequestData.url,
+          new URLSearchParams(appendParams),
+          {
+            headers: {
+              ...appendAuthHeader,
+              "Content-Type": "application/x-www-form-urlencoded",
+            },
+          }
+        );
       }
 
       // FINALIZE
-      const finalizeParams = new URLSearchParams({ command: "FINALIZE", media_id: mediaId });
+      const finalizeParams = {
+        command: "FINALIZE",
+        media_id: mediaId,
+      };
+      const finalizeRequestData = {
+        url: "https://upload.twitter.com/1.1/media/upload.json",
+        method: "POST",
+        data: finalizeParams,
+      };
+      const finalizeAuthHeader = oauth.toHeader(oauth.authorize(finalizeRequestData, userToken));
       await axios.post(
-        "https://upload.twitter.com/1.1/media/upload.json",
-        finalizeParams,
-        { headers: { Authorization: `Bearer ${req.session.accessToken}` } }
+        finalizeRequestData.url,
+        new URLSearchParams(finalizeParams),
+        {
+          headers: {
+            ...finalizeAuthHeader,
+            "Content-Type": "application/x-www-form-urlencoded",
+          },
+        }
       );
     }
 
-    // ── Create the tweet ──────────────────────────────────────────────────────
-    const tweetBody = { text };
-    if (mediaId) tweetBody.media = { media_ids: [mediaId] };
+    // ── Create the tweet via v1.1 statuses/update ─────────────────────────────
+    const tweetParams = { status: text };
+    if (mediaId) tweetParams.media_ids = mediaId;
+
+    const tweetRequestData = {
+      url: "https://api.twitter.com/1.1/statuses/update.json",
+      method: "POST",
+      data: tweetParams,
+    };
+    const tweetAuthHeader = oauth.toHeader(oauth.authorize(tweetRequestData, userToken));
 
     const tweetResp = await axios.post(
-      "https://api.twitter.com/2/tweets",
-      tweetBody,
+      tweetRequestData.url,
+      new URLSearchParams(tweetParams),
       {
         headers: {
-          Authorization: `Bearer ${req.session.accessToken}`,
-          "Content-Type": "application/json",
+          ...tweetAuthHeader,
+          "Content-Type": "application/x-www-form-urlencoded",
         },
       }
     );
 
     console.log("Tweet posted successfully:", tweetResp.data);
-    res.json({ id: tweetResp.data.data.id, text: tweetResp.data.data.text });
+    res.json({ id: tweetResp.data.id_str, text: tweetResp.data.text });
   } catch (err) {
     const apiErr = err.response?.data;
     const status = err.response?.status;
     console.error("Post error:", { status, data: apiErr, message: err.message });
     console.error("Full error:", err);
 
-    // Auto-refresh token on 401
-    if (err.response?.status === 401 && req.session.refreshToken) {
-      try {
-        const tokens = await refreshAccessToken(req.session.refreshToken);
-        req.session.accessToken = tokens.access_token;
-        if (tokens.refresh_token) req.session.refreshToken = tokens.refresh_token;
-        return res.status(401).json({ error: "Token refreshed — please try again." });
-      } catch (refreshErr) {
-        req.session.destroy();
-        return res.status(401).json({ error: "Session expired. Please log in again." });
-      }
-    }
-
-    res.status(500).json({ error: apiErr?.detail || apiErr?.title || err.message });
+    res
+      .status(status || 500)
+      .json({ error: apiErr?.errors?.[0]?.message || apiErr?.detail || apiErr?.title || err.message });
   }
 });
 

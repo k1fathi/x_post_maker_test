@@ -8,8 +8,8 @@ services:
       - "3000"
     environment:
       - NODE_ENV=production
-      - CLIENT_ID=${CLIENT_ID}
-      - CLIENT_SECRET=${CLIENT_SECRET}
+      - CONSUMER_KEY=${CONSUMER_KEY}
+      - CONSUMER_SECRET=${CONSUMER_SECRET}
       - REDIRECT_URI=${REDIRECT_URI:-https://vibte.co/callback}
       - PORT=3000
     restart: unless-stopped
