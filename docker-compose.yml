@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  x-poster:
+    build: .
+    container_name: x-poster
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - CLIENT_ID=${CLIENT_ID}
+      - CLIENT_SECRET=${CLIENT_SECRET}
+      - REDIRECT_URI=${REDIRECT_URI:-https://vibte.co/callback}
+      - PORT=3000
+    restart: unless-stopped

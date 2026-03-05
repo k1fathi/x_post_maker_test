@@ -1,0 +1,16 @@
+{
+  "name": "x-poster",
+  "version": "1.0.0",
+  "description": "Post to X.com via OAuth2 with media URL support",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.0",
+    "dotenv": "^16.4.0",
+    "express": "^4.19.0",
+    "express-session": "^1.18.0",
+    "open": "^10.1.0"
+  }
+}
