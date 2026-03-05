@@ -28,3 +28,6 @@ Thumbs.db
 # Build outputs
 dist/
 build/
+
+# SSL certificates (server path - uncomment if local)
+# ssl/
