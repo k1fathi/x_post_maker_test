@@ -1,9 +1,12 @@
 require("dotenv").config();
+const path = require("path");
 const express = require("express");
 const session = require("express-session");
 const axios = require("axios");
 const crypto = require("crypto");
 const OAuth = require("oauth-1.0a");
+const low = require("lowdb");
+const FileSync = require("lowdb/adapters/FileSync");
 
 const app = express();
 // behind nginx / Docker, trust proxy so redirects & protocol are correct
@@ -24,6 +27,20 @@ const PORT = process.env.PORT || 3000;
 // For production the callback is https://vibte.co/callback. You can override with REDIRECT_URI if needed.
 const REDIRECT_URI = process.env.REDIRECT_URI || "https://vibte.co/callback";
 
+// ─── LowDB setup for access tokens ────────────────────────────────────────────
+const dbFile = path.join(__dirname, "db.json");
+const adapter = new FileSync(dbFile);
+const db = low(adapter);
+
+db.defaults({ tokens: [] }).write();
+
+// Seed with a default token if none exist (you can edit db.json later)
+if (db.get("tokens").size().value() === 0) {
+  db.get("tokens")
+    .push({ token: "lfghsfdbnlkvgdhsoiflgh", description: "default access token" })
+    .write();
+}
+
 // ─── OAuth 1.0a helper ────────────────────────────────────────────────────────
 
 const oauth = OAuth({
@@ -34,10 +51,35 @@ const oauth = OAuth({
   },
 });
 
+// ─── Token guard middleware ───────────────────────────────────────────────────
+
+function requirePortalToken(req, res, next) {
+  const urlToken = req.query.token;
+  const sessionToken = req.session.portalToken;
+  const candidate = urlToken || sessionToken;
+
+  if (!candidate) {
+    return res
+      .status(401)
+      .send("Missing access token. Open the link with ?token=YOUR_TOKEN in the URL.");
+  }
+
+  const record = db.get("tokens").find({ token: candidate }).value();
+  if (!record) {
+    return res.status(401).send("Invalid access token.");
+  }
+
+  if (!sessionToken) {
+    req.session.portalToken = candidate;
+  }
+
+  next();
+}
+
 // ─── Routes ───────────────────────────────────────────────────────────────────
 
-// 1. Home — show login or post form
-app.get("/", (req, res) => {
+// 1. Home — show login or post form (protected by URL token)
+app.get("/", requirePortalToken, (req, res) => {
   if (!req.session.oauthAccessToken || !req.session.oauthAccessTokenSecret) {
     return res.redirect("/login");
   }
@@ -151,8 +193,8 @@ app.get("/", (req, res) => {
 </html>`);
 });
 
-// 2. Start OAuth 1.0a flow (request token → redirect to X)
-app.get("/login", async (req, res) => {
+// 2. Start OAuth 1.0a flow (request token → redirect to X), requires portal token
+app.get("/login", requirePortalToken, async (req, res) => {
   try {
     const requestData = {
       url: "https://api.twitter.com/oauth/request_token",
