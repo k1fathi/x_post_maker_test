@@ -30,19 +30,26 @@ function generatePKCE() {
 }
 
 async function refreshAccessToken(refreshToken) {
+  console.log("Attempting to refresh access token...");
   const params = new URLSearchParams({
     grant_type: "refresh_token",
     refresh_token: refreshToken,
     client_id: CLIENT_ID,
   });
   const creds = Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString("base64");
-  const { data } = await axios.post("https://api.twitter.com/2/oauth2/token", params, {
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded",
-      Authorization: `Basic ${creds}`,
-    },
-  });
-  return data;
+  try {
+    const { data } = await axios.post("https://api.twitter.com/2/oauth2/token", params, {
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        Authorization: `Basic ${creds}`,
+      },
+    });
+    console.log("Token refresh successful");
+    return data;
+  } catch (err) {
+    console.error("Token refresh failed:", err.response?.data || err.message);
+    throw err;
+  }
 }
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
@@ -197,6 +204,7 @@ app.get("/callback", async (req, res) => {
     });
 
     const creds = Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString("base64");
+    console.log("Exchanging code for tokens with redirect_uri:", REDIRECT_URI);
     const { data } = await axios.post("https://api.twitter.com/2/oauth2/token", params, {
       headers: {
         "Content-Type": "application/x-www-form-urlencoded",
@@ -204,8 +212,10 @@ app.get("/callback", async (req, res) => {
       },
     });
 
+    console.log("OAuth token exchange successful");
     req.session.accessToken = data.access_token;
     req.session.refreshToken = data.refresh_token;
+    console.log("OAuth tokens received - access_token present:", !!data.access_token, "refresh_token present:", !!data.refresh_token);
     delete req.session.pkceVerifier;
     delete req.session.oauthState;
 
@@ -287,10 +297,13 @@ app.post("/post", async (req, res) => {
       }
     );
 
+    console.log("Tweet posted successfully:", tweetResp.data);
     res.json({ id: tweetResp.data.data.id, text: tweetResp.data.data.text });
   } catch (err) {
     const apiErr = err.response?.data;
-    console.error("Post error:", apiErr || err.message);
+    const status = err.response?.status;
+    console.error("Post error:", { status, data: apiErr, message: err.message });
+    console.error("Full error:", err);
 
     // Auto-refresh token on 401
     if (err.response?.status === 401 && req.session.refreshToken) {
