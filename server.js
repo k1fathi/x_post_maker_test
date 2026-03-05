@@ -23,6 +23,9 @@ app.use(
 
 const CONSUMER_KEY = process.env.CONSUMER_KEY;
 const CONSUMER_SECRET = process.env.CONSUMER_SECRET;
+const ACCESS_TOKEN = process.env.ACCESS_TOKEN;
+const ACCESS_TOKEN_SECRET = process.env.ACCESS_TOKEN_SECRET;
+const BEARER_TOKEN = process.env.BEARER_TOKEN; // not currently used, reserved for future v2 calls
 const PORT = process.env.PORT || 3000;
 // For production the callback is https://vibte.co/callback. You can override with REDIRECT_URI if needed.
 const REDIRECT_URI = process.env.REDIRECT_URI || "https://vibte.co/callback";
@@ -78,12 +81,8 @@ function requirePortalToken(req, res, next) {
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
 
-// 1. Home — show login or post form (protected by URL token)
+// 1. Home — show post form (protected by URL token only)
 app.get("/", requirePortalToken, (req, res) => {
-  if (!req.session.oauthAccessToken || !req.session.oauthAccessTokenSecret) {
-    return res.redirect("/login");
-  }
-
   res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -193,101 +192,15 @@ app.get("/", requirePortalToken, (req, res) => {
 </html>`);
 });
 
-// 2. Start OAuth 1.0a flow (request token → redirect to X), requires portal token
-app.get("/login", requirePortalToken, async (req, res) => {
-  try {
-    const requestData = {
-      url: "https://api.twitter.com/oauth/request_token",
-      method: "POST",
-      data: { oauth_callback: REDIRECT_URI },
-    };
-
-    const authHeader = oauth.toHeader(oauth.authorize(requestData));
-
-    const { data } = await axios.post(requestData.url, null, {
-      headers: {
-        Authorization: authHeader.Authorization,
-      },
-    });
-
-    const params = new URLSearchParams(data);
-    const oauthToken = params.get("oauth_token");
-    const oauthTokenSecret = params.get("oauth_token_secret");
-
-    if (!oauthToken || !oauthTokenSecret) {
-      console.error("Failed to obtain request token:", data);
-      return res.send("Failed to obtain request token. Check your consumer key/secret and app settings.");
-    }
-
-    req.session.oauthRequestToken = oauthToken;
-    req.session.oauthRequestTokenSecret = oauthTokenSecret;
-
-    res.redirect(`https://api.twitter.com/oauth/authenticate?oauth_token=${oauthToken}`);
-  } catch (err) {
-    console.error("Request token error:", err.response?.data || err.message);
-    res.send("Failed to start OAuth 1.0a flow. Check your credentials.");
-  }
-});
-
-// 3. OAuth 1.0a callback (exchange request token + verifier for access token)
-app.get("/callback", async (req, res) => {
-  const { oauth_token, oauth_verifier, denied } = req.query;
-
-  if (denied) return res.send("You denied the app.");
-  if (!oauth_token || !oauth_verifier) return res.send("Missing OAuth callback parameters.");
-  if (oauth_token !== req.session.oauthRequestToken) return res.send("Token mismatch — possible CSRF.");
-
-  try {
-    const requestData = {
-      url: "https://api.twitter.com/oauth/access_token",
-      method: "POST",
-      data: { oauth_verifier },
-    };
-
-    const token = {
-      key: req.session.oauthRequestToken,
-      secret: req.session.oauthRequestTokenSecret,
-    };
-
-    const authHeader = oauth.toHeader(oauth.authorize(requestData, token));
-
-    const { data } = await axios.post(requestData.url, null, {
-      headers: {
-        Authorization: authHeader.Authorization,
-      },
-      params: { oauth_verifier },
-    });
-
-    const params = new URLSearchParams(data);
-    const accessToken = params.get("oauth_token");
-    const accessTokenSecret = params.get("oauth_token_secret");
-
-    if (!accessToken || !accessTokenSecret) {
-      console.error("Failed to obtain access token:", data);
-      return res.send("Failed to obtain access token.");
-    }
-
-    req.session.oauthAccessToken = accessToken;
-    req.session.oauthAccessTokenSecret = accessTokenSecret;
-    delete req.session.oauthRequestToken;
-    delete req.session.oauthRequestTokenSecret;
-
-    res.redirect("/");
-  } catch (err) {
-    console.error("Access token error:", err.response?.data || err.message);
-    res.send("Failed to complete OAuth 1.0a callback. Check your app configuration.");
-  }
-});
-
-// 4. Post a tweet (with optional media) using OAuth 1.0a
-app.post("/post", async (req, res) => {
-  if (!req.session.oauthAccessToken || !req.session.oauthAccessTokenSecret) {
-    return res.status(401).json({ error: "Not authenticated" });
+// 2. Post a tweet (with optional media) using OAuth 1.0a app/user tokens
+app.post("/post", requirePortalToken, async (req, res) => {
+  if (!CONSUMER_KEY || !CONSUMER_SECRET || !ACCESS_TOKEN || !ACCESS_TOKEN_SECRET) {
+    return res.status(500).json({ error: "Server is missing X API credentials." });
   }
 
   const userToken = {
-    key: req.session.oauthAccessToken,
-    secret: req.session.oauthAccessTokenSecret,
+    key: ACCESS_TOKEN,
+    secret: ACCESS_TOKEN_SECRET,
   };
 
   const { text, mediaUrl } = req.body;
